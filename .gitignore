@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+venv/
+videos/
+*.part
+
+# Instagram login cookies: never commit these
+cookies.txt
+cookies.json
