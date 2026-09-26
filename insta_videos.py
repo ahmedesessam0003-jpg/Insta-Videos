@@ -202,6 +202,10 @@ class Config:
     number_format: str
     exclude_posts: set[str]
     products: list[Product]
+    unmatched_folder: str = ""  # folder for videos that match no product ("" = skip them)
+
+
+DEFAULT_UNMATCHED_FOLDER = "من غير وصف"
 
 
 def load_config(path: Path) -> Config:
@@ -240,6 +244,7 @@ def load_config(path: Path) -> Config:
     output_dir = Path(os.path.expandvars(str(data.get("output_dir") or "videos"))).expanduser()
     if not output_dir.is_absolute():
         output_dir = path.parent / output_dir
+    unmatched = data.get("unmatched_folder", DEFAULT_UNMATCHED_FOLDER)
     return Config(
         profile=to_username(str(data.get("profile") or "")),
         output_dir=output_dir,
@@ -247,6 +252,7 @@ def load_config(path: Path) -> Config:
         number_format=data.get("number_format", "{name} ({n})"),
         exclude_posts={to_shortcode(str(p)) for p in as_list(data.get("exclude_posts"))},
         products=products,
+        unmatched_folder=str(unmatched).strip() if unmatched else "",
     )
 
 
@@ -303,6 +309,18 @@ def resolve_folders(products: list[Product], out_dir: Path) -> list[str]:
         product.folder = folder
         used.add(folder)
     return messages
+
+
+def resolve_unmatched_folder(name: str, products: list[Product], out_dir: Path) -> str:
+    """The folder for videos that match no product, reusing an existing one with the same name."""
+    key = name_key(name)
+    if key in {name_key(p.folder) for p in products}:
+        raise UserError(f"اسم unmatched_folder «{name}» هو نفس اسم مجلد منتج؛ اختر اسماً آخر.")
+    if out_dir.is_dir():
+        for path in sorted(out_dir.iterdir()):
+            if path.is_dir() and name_key(path.name) == key:
+                return path.name
+    return safe_name(name)
 
 
 def plan_names(base: str, count: int, taken: set[str], number_format: str) -> list[str]:
@@ -706,19 +724,30 @@ def _rename(folder_dir: Path, old: str, new: str) -> None:
 
 def sync_folder(out_dir: Path, folder: str, wanted: dict[str, Video], state: State,
                 number_format: str, downloader: Downloader | None,
-                results: dict[tuple[str, str], tuple[str, str]], dry_run: bool) -> dict[str, int]:
+                results: dict[tuple[str, str], tuple[str, str]], dry_run: bool,
+                unmatched: str = "", moved: set[str] | None = None) -> dict[str, int]:
     """Bring one product folder in line with the wanted videos.
 
     Videos are ordered by date and named "<folder>.mp4" (only one video) or
     "<folder> (1).mp4", "<folder> (2).mp4", ... Files downloaded earlier are
     renamed when the numbering changes; files the script did not create are
     never touched.
+
+    A video found in the `unmatched` folder (videos matching no product) is
+    moved from there instead of being copied, and its key is added to `moved`.
+    A dry run moves nothing, so when it syncs the `unmatched` folder itself the
+    keys in `moved` are treated as gone.
     """
+    moved = set() if moved is None else moved
     folder_dir = out_dir / folder
     managed = state.folders.setdefault(folder, {})
     for key, info in list(managed.items()):  # forget files the user deleted
         if not (folder_dir / info["file"]).is_file():
             del managed[key]
+    own_files = {info["file"].lower() for info in managed.values()}
+    if dry_run and folder == unmatched:
+        for key in moved:
+            managed.pop(key, None)  # the state is never saved in a dry run
     new_keys = [key for key in wanted if key not in managed]
     counts = {"new": 0, "renamed": 0, "failed": 0, "total": 0}
     if not managed and not new_keys:
@@ -727,7 +756,6 @@ def sync_folder(out_dir: Path, folder: str, wanted: dict[str, Video], state: Sta
     entries = sorted([(info["date"], key) for key, info in managed.items()] +
                      [(wanted[key].stamp, key) for key in new_keys])
     counts["total"] = len(entries)
-    own_files = {info["file"].lower() for info in managed.values()}
     taken = ({p.name.lower() for p in folder_dir.iterdir()} - own_files) if folder_dir.is_dir() else set()
     names = plan_names(folder, len(entries), taken, number_format)
     target = {key: name for (_, key), name in zip(entries, names)}
@@ -756,31 +784,43 @@ def sync_folder(out_dir: Path, folder: str, wanted: dict[str, Video], state: Sta
         if key in managed:
             continue
         video, name = wanted[key], target[key]
+        # A video that was saved as matching no product, but now matches this one.
+        info = state.folders.get(unmatched, {}).get(key) if unmatched and folder != unmatched else None
+        source = out_dir / unmatched / info["file"] if info else None
+        moving = source is not None and source.is_file()
         if dry_run:
-            log(f"  ↓ (تجربة) {folder}/{name}")
-            results[(folder, key)] = (name, "سيتم تحميله")
+            if moving:
+                moved.add(key)
+            log(f"  {'→' if moving else '↓'} (تجربة) {folder}/{name}")
+            results[(folder, key)] = (name, f"سيُنقل من «{unmatched}»" if moving else "سيتم تحميله")
             counts["new"] += 1
             continue
         dest = folder_dir / name
         folder_dir.mkdir(parents=True, exist_ok=True)
         try:
-            source = _existing_copy(out_dir, state, key)
-            if source is not None:
-                shutil.copy2(source, dest)
+            if moving:
+                os.replace(source, dest)
+                del state.folders[unmatched][key]
+                moved.add(key)
+            elif (copy := _existing_copy(out_dir, state, key)) is not None:
+                shutil.copy2(copy, dest)
             else:
                 downloader.fetch(video.url, dest)
                 _set_mtime(dest, video.date)
         except Exception as exc:
-            log(f"  ✗ فشل تحميل {name}: {exc}")
-            results[(folder, key)] = (name, f"فشل التحميل: {exc}")
+            action = "نقل" if moving else "تحميل"
+            log(f"  ✗ فشل {action} {name}: {exc}")
+            results[(folder, key)] = (name, f"فشل ال{action}: {exc}")
             counts["failed"] += 1
             continue
-        size = dest.stat().st_size / (1024 * 1024)
-        log(f"  ↓ {folder}/{name}  ({size:.1f} MB)")
+        if moving:
+            log(f"  → {folder}/{name}  (نُقل من «{unmatched}»)")
+        else:
+            log(f"  ↓ {folder}/{name}  ({dest.stat().st_size / (1024 * 1024):.1f} MB)")
         managed[key] = {"file": name, "date": video.stamp,
                         "post": f"https://www.instagram.com/p/{video.shortcode}/",
                         "keyword": video.keyword}
-        results[(folder, key)] = (name, "تم التحميل")
+        results[(folder, key)] = (name, f"نُقل من «{unmatched}»" if moving else "تم التحميل")
         counts["new"] += 1
         state.save()
     return counts
@@ -851,11 +891,17 @@ def backend_order(choice: str, has_cookies: bool) -> list[str]:
     return ["gallery-dl", "instaloader"] if has_cookies else ["instaloader"]
 
 
+NO_MATCH = "لا يطابق أي منتج"
+
+
 def scan_posts(posts: Iterator[PostRecord], config: Config, mode: str,
-               wanted: dict[str, dict[str, Video]], post_rows: list) -> tuple[int, Exception | None]:
+               wanted: dict[str, dict[str, Video]], post_rows: list,
+               unmatched: str = "") -> tuple[int, Exception | None]:
     """Match each post's caption against the products.
 
-    Fills `wanted` (videos per folder) and `post_rows` (for the report).
+    Videos matching no product go to the `unmatched` folder ("" = skip them).
+    Fills `wanted` (videos per folder) and `post_rows`, entries of
+    (post, [(folder, keyword)], videos, status) for the report.
     Returns the number of posts scanned and the error that stopped the scan, if any.
     """
     scanned = 0
@@ -870,25 +916,26 @@ def scan_posts(posts: Iterator[PostRecord], config: Config, mode: str,
                 post_rows.append((post, [], [], "مستبعد (exclude_posts)"))
                 continue
             matches = match_caption(post.caption, config.products, mode)
-            if not matches:
-                post_rows.append((post, [], [], "لا يطابق أي منتج"))
+            if not matches and not unmatched:
+                post_rows.append((post, [], [], NO_MATCH))
                 continue
+            targets = [(m.product.folder, m.keyword) for m in matches] or [(unmatched, "")]
             try:
                 videos = post.get_videos()
             except Exception as exc:  # one broken post should not stop the scan
-                post_rows.append((post, matches, [], f"تعذر جلب رابط الفيديو: {exc}"))
+                post_rows.append((post, targets, [], f"تعذر جلب رابط الفيديو: {exc}"))
                 log(f"  ✗ تعذر جلب فيديو المنشور {post.url}: {exc}")
                 continue
             if not videos:
-                post_rows.append((post, matches, [], "لا يحتوي على فيديو"))
+                post_rows.append((post, targets if matches else [], [], "لا يحتوي على فيديو"))
                 continue
-            post_rows.append((post, matches, videos, ""))
-            for match in matches:
+            post_rows.append((post, targets, videos, ""))
+            for folder, keyword in targets:
                 for index, url in videos:
-                    video = Video(post.shortcode, index, post.date, url, match.keyword)
-                    wanted[match.product.folder].setdefault(video.key, video)
-            folders = " | ".join(m.product.folder for m in matches)
-            log(f"  ✓ {post.date:%Y-%m-%d} {post.url} (فيديوهات: {len(videos)}) → {folders}")
+                    video = Video(post.shortcode, index, post.date, url, keyword)
+                    wanted[folder].setdefault(video.key, video)
+            folders = " | ".join(folder for folder, _ in targets)
+            log(f"  {'✓' if matches else '○'} {post.date:%Y-%m-%d} {post.url} (فيديوهات: {len(videos)}) → {folders}")
     except UserError:
         raise
     except Exception as exc:
@@ -919,6 +966,11 @@ def run(args: argparse.Namespace) -> int:
     log(f"• مجلد المنتجات: {out_dir}")
     for message in resolve_folders(products, out_dir):
         log(message)
+    unmatched = ""
+    if config.unmatched_folder:
+        unmatched = resolve_unmatched_folder(config.unmatched_folder, products, out_dir)
+        log(f"  {'✓ مجلد موجود' if (out_dir / unmatched).is_dir() else '+ مجلد جديد'}"
+            f" للفيديوهات التي لا تطابق أي منتج: {unmatched}")
 
     cookie_path = args.cookies
     if not (cookie_path or args.browser or args.login):
@@ -938,8 +990,9 @@ def run(args: argparse.Namespace) -> int:
         raise UserError("طريقة gallery-dl لا تدعم --login؛ استخدم ملف الكوكيز أو --browser.")
     order = backend_order(args.backend, cookies is not None)
 
-    wanted: dict[str, dict[str, Video]] = {p.folder: {} for p in products}
-    post_rows: list[tuple[PostRecord, list[Match], list[tuple[int, str]], str]] = []
+    folders = [p.folder for p in products] + ([unmatched] if unmatched else [])
+    wanted: dict[str, dict[str, Video]] = {folder: {} for folder in folders}
+    post_rows: list[tuple[PostRecord, list[tuple[str, str]], list[tuple[int, str]], str]] = []
     scanned, crawl_error = 0, None
     for position, name in enumerate(order):
         fallback = order[position + 1] if position + 1 < len(order) else None
@@ -957,7 +1010,7 @@ def run(args: argparse.Namespace) -> int:
 
         log(f"\n• فحص منشورات الحساب {profile} (الطريقة: {name}) ...")
         posts = itertools.islice(backend.iter_posts(args.reels), args.max_posts)
-        scanned, crawl_error = scan_posts(posts, config, mode, wanted, post_rows)
+        scanned, crawl_error = scan_posts(posts, config, mode, wanted, post_rows, unmatched)
         if crawl_error is None:
             break
         log(explain_error(crawl_error, name, at_start=not scanned, suggest_other=len(order) == 1))
@@ -968,34 +1021,36 @@ def run(args: argparse.Namespace) -> int:
             continue
         break
 
-    found = sum(len(v) for v in wanted.values())
-    log(f"\n• المنشورات التي تم فحصها: {scanned} — الفيديوهات المطابقة: {found}")
+    found = sum(len(wanted[p.folder]) for p in products)
+    extra = f" — فيديوهات لا تطابق أي منتج: {len(wanted[unmatched])}" if unmatched else ""
+    log(f"\n• المنشورات التي تم فحصها: {scanned} — فيديوهات المنتجات: {found}{extra}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     state = State(out_dir / STATE_FILE)
     downloader = None if args.dry_run else Downloader()
     results: dict[tuple[str, str], tuple[str, str]] = {}
+    moved: set[str] = set()  # videos moved from the unmatched folder into a product folder
     summary = []
-    for product in products:
-        counts = sync_folder(out_dir, product.folder, wanted[product.folder], state,
-                             config.number_format, downloader, results, args.dry_run)
+    for folder in folders:  # the unmatched folder comes last, after videos were moved out of it
+        counts = sync_folder(out_dir, folder, wanted[folder], state, config.number_format,
+                             downloader, results, args.dry_run, unmatched, moved)
         if counts["total"] or counts["new"]:
-            summary.append((product.folder, counts))
+            summary.append((folder, counts))
 
     rows = []
-    for post, matches, videos, status in post_rows:
+    for post, targets, videos, status in post_rows:
         base = {"التاريخ": f"{post.date:%Y-%m-%d %H:%M}", "رابط المنشور": post.url,
                 "النوع": KIND_NAMES.get(post.kind, post.kind),
                 "الوصف": " ".join(post.caption.split())[:500]}
         if not videos:
-            rows.append({**base, "المنتج (المجلد)": " | ".join(m.product.folder for m in matches),
+            rows.append({**base, "المنتج (المجلد)": " | ".join(folder for folder, _ in targets),
                          "الحالة": status})
             continue
-        for match in matches:
+        for folder, keyword in targets:
             for index, _ in videos:
-                name, result = results.get((match.product.folder, f"{post.shortcode}_{index}"), ("", ""))
-                rows.append({**base, "المنتج (المجلد)": match.product.folder,
-                             "الكلمة المطابقة": match.keyword, "اسم الملف": name, "الحالة": result})
+                name, result = results.get((folder, f"{post.shortcode}_{index}"), ("", ""))
+                rows.append({**base, "المنتج (المجلد)": folder, "الكلمة المطابقة": keyword,
+                             "اسم الملف": name, "الحالة": result})
     report_path = out_dir / REPORT_FILE if scanned else None  # keep the last report if nothing was scanned
     if report_path:
         try:
@@ -1014,9 +1069,13 @@ def run(args: argparse.Namespace) -> int:
         log(f"  {folder}: " + "، ".join(parts))
     if not summary:
         log("  لا توجد فيديوهات مطابقة.")
-    unmatched = sum(1 for _, m, _, _ in post_rows if not m)
-    if unmatched:
-        log(f"  منشورات فيديو لم تطابق أي منتج: {unmatched} (راجع التقرير لإضافة كلمات بحث)")
+    no_match = sum(1 for _, targets, videos, status in post_rows
+                   if status == NO_MATCH or (unmatched and videos and targets == [(unmatched, "")]))
+    if no_match and unmatched:
+        log(f"  منشورات لا تطابق أي منتج: {no_match} (فيديوهاتها في مجلد «{unmatched}»؛ "
+            "راجع التقرير لإضافة كلمات بحث)")
+    elif no_match:
+        log(f"  منشورات فيديو لم تطابق أي منتج: {no_match} (راجع التقرير لإضافة كلمات بحث)")
     if report_path:
         log(f"• التقرير: {report_path}")
     failed = sum(c["failed"] for _, c in summary)

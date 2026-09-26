@@ -3,6 +3,7 @@
   "output_dir": "videos",
   "match_mode": "first",
   "number_format": "{name} ({n})",
+  "unmatched_folder": "من غير وصف",
   "exclude_posts": [],
   "products": [
     {

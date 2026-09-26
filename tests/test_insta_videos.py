@@ -435,14 +435,93 @@ class RunTests(unittest.TestCase):
             spray = product_named("بخاخ")
             self.assertEqual([p.name for p in (out / spray).iterdir()], [f"{spray}.mp4"])
             self.assertFalse((out / product_named("بودرة السدر")).exists())  # "first" mode
+            self.assertEqual([p.name for p in (out / "من غير وصف").iterdir()], ["من غير وصف.mp4"])
 
             with open(out / iv.REPORT_FILE, encoding="utf-8-sig") as fh:
                 rows = list(csv.DictReader(fh))
             statuses = {(r["رابط المنشور"].split("/")[-2], r["اسم الملف"]): r["الحالة"] for r in rows}
             self.assertEqual(statuses[("P5", f"{wasma}.mp4")], "تم التحميل")
-            self.assertEqual(statuses[("P2", "")], "لا يطابق أي منتج")
+            self.assertEqual(statuses[("P2", "من غير وصف.mp4")], "تم التحميل")
             self.assertEqual(statuses[("P0", "")], "مستبعد (exclude_posts)")
             self.assertNotIn("P4", {key for key, _ in statuses})
+
+
+class UnmatchedFolderTests(unittest.TestCase):
+    """Videos matching no product get their own folder, and move out once a keyword matches."""
+
+    POSTS = [
+        record("A", 1, "الوسمة الطبيعية"),
+        record("B", 2, ""),  # no caption at all
+        record("C", 3, "عرض خاص على الباقة"),  # a caption without any product
+        iv.PostRecord("D", dt.datetime(2024, 2, 4), "صور المحل", "carousel", lambda: []),  # no video
+        record("E", 5, "صورة", kind="image"),
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_main(self, extra_keywords=(), unmatched="من غير وصف", dry_run=False):
+        config = {"profile": "x", "unmatched_folder": unmatched,
+                  "products": [{"name": "الوسمة", "keywords": ["الوسمة", *extra_keywords]}]}
+        path = self.root / "products.json"
+        path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        downloader = FakeDownloader()
+        argv = ["--config", str(path), "--out", str(self.out)] + (["--dry-run"] if dry_run else [])
+        with mock.patch.object(iv, "InstaloaderBackend", fake_backend("instaloader", [], self.POSTS)), \
+                mock.patch.object(iv, "Downloader", lambda: downloader), \
+                mock.patch.object(iv, "find_cookie_file", lambda: None), \
+                mock.patch("builtins.print"):
+            code = iv.main(argv)
+        with open(self.out / iv.REPORT_FILE, encoding="utf-8-sig") as fh:
+            report = {(r["رابط المنشور"].split("/")[-2], r["المنتج (المجلد)"]): r for r in csv.DictReader(fh)}
+        return code, downloader.calls, report
+
+    def files(self, folder):
+        path = self.out / folder
+        return sorted(p.name for p in path.iterdir()) if path.is_dir() else []
+
+    def test_every_video_is_downloaded_and_moves_when_a_keyword_matches(self):
+        code, calls, report = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["https://cdn/A.mp4", "https://cdn/B.mp4", "https://cdn/C.mp4"])
+        self.assertEqual(self.files("الوسمة"), ["الوسمة.mp4"])
+        self.assertEqual(self.files("من غير وصف"), ["من غير وصف (1).mp4", "من غير وصف (2).mp4"])
+        self.assertEqual(report[("C", "من غير وصف")]["اسم الملف"], "من غير وصف (2).mp4")
+        self.assertEqual(report[("D", "")]["الحالة"], "لا يحتوي على فيديو")
+        self.assertNotIn("E", {post for post, _ in report})
+
+        # A dry run with a new keyword shows the move but changes nothing.
+        code, calls, report = self.run_main(["الباقة"], dry_run=True)
+        self.assertEqual((code, calls), (0, []))
+        self.assertEqual(report[("C", "الوسمة")]["الحالة"], "سيُنقل من «من غير وصف»")
+        self.assertEqual(self.files("من غير وصف"), ["من غير وصف (1).mp4", "من غير وصف (2).mp4"])
+
+        # The real run moves the file instead of downloading it again, and renumbers both folders.
+        code, calls, report = self.run_main(["الباقة"])
+        self.assertEqual((code, calls), (0, []))
+        self.assertEqual(self.files("الوسمة"), ["الوسمة (1).mp4", "الوسمة (2).mp4"])
+        self.assertEqual((self.out / "الوسمة" / "الوسمة (2).mp4").read_text(), "https://cdn/C.mp4")
+        self.assertEqual(self.files("من غير وصف"), ["من غير وصف.mp4"])
+        self.assertEqual((self.out / "من غير وصف" / "من غير وصف.mp4").read_text(), "https://cdn/B.mp4")
+        self.assertEqual(report[("C", "الوسمة")]["الحالة"], "نُقل من «من غير وصف»")
+
+    def test_the_folder_can_be_turned_off(self):
+        code, calls, report = self.run_main(unmatched="")
+        self.assertEqual((code, calls), (0, ["https://cdn/A.mp4"]))
+        self.assertFalse((self.out / "من غير وصف").exists())
+        self.assertEqual(report[("C", "")]["الحالة"], "لا يطابق أي منتج")
+
+    def test_the_folder_cannot_be_a_product_folder(self):
+        path = self.root / "products.json"
+        path.write_text(json.dumps({"profile": "x", "unmatched_folder": "الوسمه",
+                                    "products": [{"name": "الوسمة"}]}, ensure_ascii=False), encoding="utf-8")
+        with mock.patch("builtins.print"):
+            self.assertEqual(iv.main(["--config", str(path), "--out", str(self.out), "--dry-run"]), 2)
 
 
 @unittest.skipUnless(__import__("importlib").util.find_spec("instaloader"), "instaloader not installed")
