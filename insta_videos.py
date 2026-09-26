@@ -35,8 +35,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_FILE = ".insta-videos-state.json"
 REPORT_FILE = "videos_report.csv"
 COOKIE_FILES = ("cookies.txt", "cookies.json")
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+# Instagram's CDN throttles video downloads for full browser user agents;
+# gallery-dl uses this bare one for the same reason.
+VIDEO_USER_AGENT = "Mozilla/5.0"
 
 
 class UserError(Exception):
@@ -401,6 +402,11 @@ def browser_cookies(spec: str) -> dict[str, str]:
 class InstaloaderBackend:
     """Scans the profile with instaloader (works anonymously, with cookies or with a login)."""
 
+    # Until the first post arrives a failed request is not retried: Instagram now
+    # answers instaloader's first request with "429 Too Many Requests", and
+    # instaloader would wait about 11 minutes before each retry for nothing.
+    FIRST_ATTEMPTS, LATER_ATTEMPTS = 1, 3
+
     def __init__(self, profile: str, cookies: dict[str, str] | None, login: str | None):
         try:
             import instaloader
@@ -411,7 +417,7 @@ class InstaloaderBackend:
         self.loader = instaloader.Instaloader(
             download_pictures=False, download_videos=False, download_video_thumbnails=False,
             download_geotags=False, download_comments=False, save_metadata=False,
-            compress_json=False, max_connection_attempts=3, request_timeout=60)
+            compress_json=False, max_connection_attempts=self.FIRST_ATTEMPTS, request_timeout=60)
         if cookies:
             self._use_cookies(cookies)
         elif login:
@@ -480,6 +486,8 @@ class InstaloaderBackend:
             sources.append(profile.get_reels)
         for source in sources:
             for post in source():
+                # Posts are coming through, so from now on a 429 is a real rate limit worth waiting for.
+                self.loader.context.max_connection_attempts = self.LATER_ATTEMPTS
                 if post.shortcode not in seen:
                     seen.add(post.shortcode)
                     yield self._record(post)
@@ -505,7 +513,7 @@ class InstaloaderBackend:
 class GalleryDlBackend:
     """Scans the profile with gallery-dl (needs cookies of a logged-in account)."""
 
-    def __init__(self, profile: str, cookies: dict[str, str] | None):
+    def __init__(self, profile: str, cookies: dict[str, str] | None, max_posts: int | None = None):
         try:
             from gallery_dl import config, job
         except ImportError:
@@ -517,6 +525,8 @@ class GalleryDlBackend:
         self.profile = profile
         config.clear()
         config.set(("extractor",), "cookies", dict(cookies))
+        if max_posts:  # stop paging there, since _extract() reads a whole section before returning
+            config.set(("extractor", "instagram"), "max-posts", max_posts)
         logging.basicConfig(level=logging.INFO, format="  [gallery-dl] %(message)s")
         log("• gallery-dl ينتظر عدة ثوانٍ بين الطلبات لتجنب الحظر، لذلك قد يبدو متوقفاً قليلاً (هذا طبيعي)")
 
@@ -560,7 +570,9 @@ class GalleryDlBackend:
                           first.get("description") or "", kind, lambda: videos)
 
 
-def explain_error(exc: Exception, backend: str) -> str:
+def explain_error(exc: Exception, backend: str, at_start: bool = False, suggest_other: bool = True) -> str:
+    """The error with hints. `at_start`: no post was received yet; `suggest_other`:
+    the other backend was not tried in this run."""
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
     hints = []
@@ -572,14 +584,23 @@ def explain_error(exc: Exception, backend: str) -> str:
                      "ثم أعد المحاولة.")
     else:
         if any(s in low for s in ("login", "401", "403", "unauthorized", "forbidden", "redirect")):
-            hints.append("إنستجرام يطلب تسجيل الدخول: استخدم ملف الكوكيز cookies.txt أو --login (انظر README).")
+            hints.append("إنستجرام يطلب تسجيل الدخول: سجّل الدخول في المتصفح ثم صدّر ملف الكوكيز cookies.txt "
+                         "من جديد (انظر README).")
         if any(s in low for s in ("429", "too many", "wait a few minutes", "rate limit")):
-            hints.append("إنستجرام أوقف الطلبات مؤقتاً لكثرتها: انتظر من نصف ساعة لساعة ثم أعد التشغيل.")
+            if backend == "instaloader" and at_start:
+                hints.append("هذا ليس حظراً بسبب كثرة الطلبات، والانتظار لا يحله: إنستجرام يرفض طريقة instaloader "
+                             "من أول طلب (مشكلة معروفة حالياً)، والطريقة التي تعمل هي gallery-dl مع ملف الكوكيز. " +
+                             ("ضع ملف cookies.txt بجانب السكربت وشغّله بدون --backend instaloader "
+                              "لتُستخدم gallery-dl تلقائياً." if suggest_other else
+                              "راجع خطأ gallery-dl المذكور أعلاه."))
+                suggest_other = False
+            else:
+                hints.append("إنستجرام أوقف الطلبات مؤقتاً لكثرتها: انتظر من نصف ساعة لساعة ثم أعد التشغيل.")
         if "checkpoint" in low or "challenge" in low:
             hints.append("إنستجرام يطلب تأكيد الحساب: افتحه من المتصفح وأكّد أنك أنت ثم أعد المحاولة.")
-        if backend == "gallery-dl":
+        if suggest_other and backend == "gallery-dl":
             hints.append("يمكنك أيضاً تجربة الطريقة الأخرى: --backend instaloader")
-        else:
+        elif suggest_other:
             hints.append("يمكنك أيضاً تجربة الطريقة الأخرى: --backend gallery-dl (مع ملف الكوكيز).")
     return "\n".join([f"✗ توقف فحص الحساب: {text}"] + [f"  - {h}" for h in hints])
 
@@ -629,7 +650,7 @@ class Downloader:
     def __init__(self):
         import requests
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT, "Referer": "https://www.instagram.com/"})
+        self.session.headers.update({"User-Agent": VIDEO_USER_AGENT, "Referer": "https://www.instagram.com/"})
 
     def fetch(self, url: str, dest: Path) -> None:
         part = dest.with_name(dest.name + ".part")
@@ -796,8 +817,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     auth.add_argument("--browser", help="قراءة الكوكيز مباشرة من المتصفح: firefox أو chrome أو edge ...")
     auth.add_argument("--login", metavar="USERNAME",
                       help="تسجيل الدخول باسم المستخدم (تُطلب كلمة السر مرة واحدة وتُحفظ الجلسة)")
-    parser.add_argument("--backend", choices=("instaloader", "gallery-dl"), default="instaloader",
-                        help="طريقة قراءة إنستجرام (الافتراضي instaloader)")
+    parser.add_argument("--backend", choices=("auto", "gallery-dl", "instaloader"), default="auto",
+                        help="طريقة قراءة إنستجرام. auto (الافتراضي): gallery-dl إذا وُجدت الكوكيز "
+                             "ثم instaloader إذا لم تصل الأولى لأي منشور، وبدون كوكيز instaloader فقط")
     parser.add_argument("--reels", action="store_true",
                         help="فحص تبويب الريلز أيضاً (للريلز غير الظاهرة في شبكة المنشورات؛ أبطأ)")
     parser.add_argument("--max-posts", type=int, metavar="N", help="فحص أحدث N منشور فقط")
@@ -815,6 +837,63 @@ def find_cookie_file() -> Path | None:
             if (folder / name).is_file():
                 return folder / name
     return None
+
+
+def backend_order(choice: str, has_cookies: bool) -> list[str]:
+    """The ways to read Instagram, in the order they are tried.
+
+    "auto" starts with gallery-dl when there are cookies, because Instagram now
+    refuses instaloader's first request with a 429. The next way is tried only
+    when the previous one found no post at all.
+    """
+    if choice != "auto":
+        return [choice]
+    return ["gallery-dl", "instaloader"] if has_cookies else ["instaloader"]
+
+
+def scan_posts(posts: Iterator[PostRecord], config: Config, mode: str,
+               wanted: dict[str, dict[str, Video]], post_rows: list) -> tuple[int, Exception | None]:
+    """Match each post's caption against the products.
+
+    Fills `wanted` (videos per folder) and `post_rows` (for the report).
+    Returns the number of posts scanned and the error that stopped the scan, if any.
+    """
+    scanned = 0
+    try:
+        for post in posts:
+            scanned += 1
+            if scanned % 24 == 0:
+                log(f"  … المنشورات التي تم فحصها حتى الآن: {scanned}")
+            if post.kind == "image":
+                continue
+            if post.shortcode in config.exclude_posts:
+                post_rows.append((post, [], [], "مستبعد (exclude_posts)"))
+                continue
+            matches = match_caption(post.caption, config.products, mode)
+            if not matches:
+                post_rows.append((post, [], [], "لا يطابق أي منتج"))
+                continue
+            try:
+                videos = post.get_videos()
+            except Exception as exc:  # one broken post should not stop the scan
+                post_rows.append((post, matches, [], f"تعذر جلب رابط الفيديو: {exc}"))
+                log(f"  ✗ تعذر جلب فيديو المنشور {post.url}: {exc}")
+                continue
+            if not videos:
+                post_rows.append((post, matches, [], "لا يحتوي على فيديو"))
+                continue
+            post_rows.append((post, matches, videos, ""))
+            for match in matches:
+                for index, url in videos:
+                    video = Video(post.shortcode, index, post.date, url, match.keyword)
+                    wanted[match.product.folder].setdefault(video.key, video)
+            folders = " | ".join(m.product.folder for m in matches)
+            log(f"  ✓ {post.date:%Y-%m-%d} {post.url} (فيديوهات: {len(videos)}) → {folders}")
+    except UserError:
+        raise
+    except Exception as exc:
+        return scanned, exc
+    return scanned, None
 
 
 def run(args: argparse.Namespace) -> int:
@@ -857,58 +936,37 @@ def run(args: argparse.Namespace) -> int:
 
     if args.backend == "gallery-dl" and args.login:
         raise UserError("طريقة gallery-dl لا تدعم --login؛ استخدم ملف الكوكيز أو --browser.")
-    try:
-        if args.backend == "gallery-dl":
-            backend = GalleryDlBackend(profile, cookies)
-        else:
-            backend = InstaloaderBackend(profile, cookies, args.login)
-    except UserError:
-        raise
-    except Exception as exc:  # e.g. no connection while checking the login
-        raise UserError(explain_error(exc, args.backend).lstrip("✗ ")) from None
+    order = backend_order(args.backend, cookies is not None)
 
-    log(f"\n• فحص منشورات الحساب {profile} ...")
     wanted: dict[str, dict[str, Video]] = {p.folder: {} for p in products}
     post_rows: list[tuple[PostRecord, list[Match], list[tuple[int, str]], str]] = []
     scanned, crawl_error = 0, None
-    posts = itertools.islice(backend.iter_posts(args.reels), args.max_posts)
-    try:
-        for post in posts:
-            scanned += 1
-            if scanned % 24 == 0:
-                log(f"  … المنشورات التي تم فحصها حتى الآن: {scanned}")
-            if post.kind == "image":
-                continue
-            if post.shortcode in config.exclude_posts:
-                post_rows.append((post, [], [], "مستبعد (exclude_posts)"))
-                continue
-            matches = match_caption(post.caption, products, mode)
-            if not matches:
-                post_rows.append((post, [], [], "لا يطابق أي منتج"))
-                continue
-            try:
-                videos = post.get_videos()
-            except Exception as exc:  # one broken post should not stop the scan
-                post_rows.append((post, matches, [], f"تعذر جلب رابط الفيديو: {exc}"))
-                log(f"  ✗ تعذر جلب فيديو المنشور {post.url}: {exc}")
-                continue
-            if not videos:
-                post_rows.append((post, matches, [], "لا يحتوي على فيديو"))
-                continue
-            post_rows.append((post, matches, videos, ""))
-            for match in matches:
-                for index, url in videos:
-                    video = Video(post.shortcode, index, post.date, url, match.keyword)
-                    wanted[match.product.folder].setdefault(video.key, video)
-            folders = " | ".join(m.product.folder for m in matches)
-            log(f"  ✓ {post.date:%Y-%m-%d} {post.url} (فيديوهات: {len(videos)}) → {folders}")
-    except UserError:
-        raise
-    except Exception as exc:
-        crawl_error = exc
-        log(explain_error(exc, args.backend))
+    for position, name in enumerate(order):
+        fallback = order[position + 1] if position + 1 < len(order) else None
+        try:
+            if name == "gallery-dl":
+                backend = GalleryDlBackend(profile, cookies, args.max_posts)
+            else:
+                backend = InstaloaderBackend(profile, cookies, args.login)
+        except Exception as exc:  # e.g. a missing library, or no connection while logging in
+            message = str(exc) if isinstance(exc, UserError) else explain_error(exc, name).lstrip("✗ ")
+            if fallback is None:
+                raise UserError(message) from None
+            log(f"✗ {message}\n• سنجرب الطريقة الأخرى: {fallback}")
+            continue
+
+        log(f"\n• فحص منشورات الحساب {profile} (الطريقة: {name}) ...")
+        posts = itertools.islice(backend.iter_posts(args.reels), args.max_posts)
+        scanned, crawl_error = scan_posts(posts, config, mode, wanted, post_rows)
+        if crawl_error is None:
+            break
+        log(explain_error(crawl_error, name, at_start=not scanned, suggest_other=len(order) == 1))
         if scanned:
             log("  سيتم تحميل ما تم العثور عليه حتى الآن؛ أعد التشغيل لاحقاً لإكمال الباقي.")
+        elif fallback:
+            log(f"• لم نصل لأي منشور بطريقة {name}، سنجرب الطريقة الأخرى: {fallback}")
+            continue
+        break
 
     found = sum(len(v) for v in wanted.values())
     log(f"\n• المنشورات التي تم فحصها: {scanned} — الفيديوهات المطابقة: {found}")

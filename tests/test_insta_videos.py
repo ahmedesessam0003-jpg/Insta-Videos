@@ -297,6 +297,7 @@ class DownloaderTests(unittest.TestCase):
             try:
                 base = f"http://127.0.0.1:{server.server_port}"
                 downloader = iv.Downloader()
+                self.assertEqual(downloader.session.headers["User-Agent"], "Mozilla/5.0")  # not throttled
                 downloader.session.trust_env = False  # never route the local server through a proxy
                 dest = root / "out.mp4"
                 downloader.fetch(f"{base}/v.mp4", dest)
@@ -322,6 +323,80 @@ class FakeBackend:
 def record(shortcode, day, caption, kind="video", urls=None):
     videos = [(i, u) for i, u in enumerate(urls or [f"https://cdn/{shortcode}.mp4"], 1)]
     return iv.PostRecord(shortcode, dt.datetime(2024, 2, day), caption, kind, lambda: videos)
+
+
+def fake_backend(name, used, posts=(), error=None):
+    """A backend class that records its use, yields `posts`, then raises `error`."""
+    class Backend:
+        def __init__(self, *args, **kwargs):
+            used.append(name)
+
+        def iter_posts(self, include_reels):
+            yield from posts
+            if error is not None:
+                raise error
+    return Backend
+
+
+class BackendChoiceTests(unittest.TestCase):
+    def test_backend_order(self):
+        self.assertEqual(iv.backend_order("auto", True), ["gallery-dl", "instaloader"])
+        self.assertEqual(iv.backend_order("auto", False), ["instaloader"])
+        self.assertEqual(iv.backend_order("instaloader", True), ["instaloader"])
+        self.assertEqual(iv.backend_order("gallery-dl", True), ["gallery-dl"])
+
+    def run_with(self, gallery_dl, instaloader, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            cookies.write_text(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\ts\n", encoding="utf-8")
+            out = Path(tmp) / "out"
+            argv = ["--out", str(out), "--cookies", str(cookies), "--dry-run", *extra]
+            lines = []
+            with mock.patch.object(iv, "GalleryDlBackend", gallery_dl), \
+                    mock.patch.object(iv, "InstaloaderBackend", instaloader), \
+                    mock.patch.object(iv, "log", lambda message="": lines.append(message)):
+                code = iv.main(argv)
+            report = (out / iv.REPORT_FILE).is_file()
+        return code, "\n".join(lines), report
+
+    def test_falls_back_when_the_first_backend_finds_nothing(self):
+        used = []
+        code, output, report = self.run_with(
+            fake_backend("gallery-dl", used, error=RuntimeError("Requested user could not be found")),
+            fake_backend("instaloader", used, posts=[record("P1", 1, "الوسمة")]))
+        self.assertEqual((code, used, report), (0, ["gallery-dl", "instaloader"], True))
+        self.assertIn("سنجرب الطريقة الأخرى: instaloader", output)
+        self.assertNotIn("--backend", output)  # the other way was tried automatically
+
+    def test_no_fallback_once_posts_were_found(self):
+        used = []
+        code, output, report = self.run_with(
+            fake_backend("gallery-dl", used, posts=[record("P1", 1, "الوسمة")], error=RuntimeError("429")),
+            fake_backend("instaloader", used))
+        self.assertEqual((code, used, report), (1, ["gallery-dl"], True))
+        self.assertIn("سيتم تحميل ما تم العثور عليه", output)
+
+    def test_an_explicit_backend_is_the_only_one_tried(self):
+        used = []
+        code, output, report = self.run_with(
+            fake_backend("gallery-dl", used),
+            fake_backend("instaloader", used, error=RuntimeError("429 Too Many Requests")),
+            ["--backend", "instaloader"])
+        self.assertEqual((code, used, report), (1, ["instaloader"], False))
+        self.assertIn("gallery-dl", output)
+
+    def test_error_hints(self):
+        blocked = RuntimeError("JSON Query to api/v1/users/web_profile_info/: 429 Too Many Requests")
+        text = iv.explain_error(blocked, "instaloader", at_start=True)
+        self.assertIn("ليس حظراً", text)
+        self.assertNotIn("انتظر", text)
+        self.assertIn("gallery-dl", text)
+        text = iv.explain_error(blocked, "instaloader", at_start=False)
+        self.assertIn("انتظر", text)
+        text = iv.explain_error(RuntimeError("HttpError: 429 Too Many Requests"), "gallery-dl",
+                                at_start=True, suggest_other=False)
+        self.assertIn("انتظر", text)
+        self.assertNotIn("--backend", text)
 
 
 class RunTests(unittest.TestCase):
@@ -445,9 +520,11 @@ class InstaloaderBackendTests(unittest.TestCase):
                 {"node": {"is_video": True, "display_url": "https://cdn/b.jpg", "video_url": "https://cdn/s1.mp4"}}]})]}
         with mock.patch("builtins.print"):
             backend = iv.InstaloaderBackend("naturalroots.store", None, None)
+        self.assertEqual(backend.loader.context.max_connection_attempts, 1)
         queries, records = self.collect(backend, [
             {"data": {"user": {**self.USER, "edge_owner_to_timeline_media": first}}},
             {"data": {"user": {"edge_owner_to_timeline_media": second}}}])
+        self.assertEqual(backend.loader.context.max_connection_attempts, 3)  # posts came, retry again
         self.assertEqual(queries, ["CURSOR"])
         self.assertEqual(records, [
             ("V1", "video", "الوسمة", [(1, "https://cdn/v1.mp4")]),
@@ -482,6 +559,79 @@ class InstaloaderBackendTests(unittest.TestCase):
         self.assertEqual(records, [
             ("R1", "video", "معجون السدر", [(1, "https://cdn/r1.mp4")]),
             ("C1", "carousel", "", [(1, "https://cdn/c1a.mp4")])])
+
+    def test_a_429_on_the_first_request_stops_at_once(self):
+        import instaloader
+        import requests
+        with mock.patch("builtins.print"):
+            backend = iv.InstaloaderBackend("naturalroots.store", None, None)
+        response = requests.Response()
+        response.status_code, response.reason, response._content = 429, "Too Many Requests", b""
+        response.url = "https://www.instagram.com/api/v1/users/web_profile_info/?username=naturalroots.store"
+        context = backend.loader.context
+        with mock.patch.object(context._session, "get", return_value=response) as get, \
+                mock.patch.object(context, "do_sleep"), \
+                mock.patch.object(instaloader.RateController, "sleep", side_effect=AssertionError("waited")), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(instaloader.ConnectionException) as caught:
+                next(backend.iter_posts(False))
+        self.assertEqual(get.call_count, 1)
+        self.assertIn("429", str(caught.exception))
+        self.assertIn("ليس حظراً", iv.explain_error(caught.exception, "instaloader", at_start=True))
+
+
+@unittest.skipUnless(__import__("importlib").util.find_spec("gallery_dl"), "gallery-dl not installed")
+class GalleryDlBackendTests(unittest.TestCase):
+    """Runs the backend through gallery-dl's real extractor code with a faked Instagram API."""
+
+    def records(self, max_posts):
+        from gallery_dl.extractor import instagram
+
+        def image(url):
+            return {"image_versions2": {"candidates": [{"url": url, "width": 1080, "height": 1350}]}}
+
+        def video(url):
+            return {"video_versions": [{"url": url, "width": 720, "height": 1280, "type": 101}]}
+
+        user = {"pk": "1", "username": "naturalroots.store", "full_name": "Natural Roots"}
+        feed = [
+            {"pk": "11", "code": "R1", "taken_at": 1700000200, "caption": {"text": "الوسمة"}, "user": user,
+             **image("https://cdn/r1.jpg"), **video("https://cdn/r1.mp4")},
+            {"pk": "12", "code": "C1", "taken_at": 1700000100, "caption": None, "user": user,
+             **image("https://cdn/c1.jpg"), "carousel_media": [
+                 {"pk": "121", **image("https://cdn/c1a.jpg")},
+                 {"pk": "122", **image("https://cdn/c1b.jpg"), **video("https://cdn/c1b.mp4")}]},
+            {"pk": "13", "code": "P1", "taken_at": 1700000000, "caption": {"text": "صورة"}, "user": user,
+             **image("https://cdn/p1.jpg")},
+        ]
+        pulled = []
+
+        def user_feed(api, handle):
+            for post in feed:
+                pulled.append(post["code"])
+                yield post
+
+        with mock.patch.object(instagram.InstagramAPI, "user_feed", user_feed), \
+                mock.patch.object(instagram.InstagramExtractor, "request",
+                                  side_effect=AssertionError("unexpected request")), \
+                mock.patch("builtins.print"):
+            backend = iv.GalleryDlBackend("naturalroots.store", {"sessionid": "s"}, max_posts)
+            records = [(r.shortcode, r.kind, r.caption, r.date, r.get_videos())
+                       for r in backend.iter_posts(False)]
+        return pulled, records
+
+    def test_posts(self):
+        pulled, records = self.records(None)
+        self.assertEqual(pulled, ["R1", "C1", "P1"])
+        self.assertEqual(records, [
+            ("R1", "video", "الوسمة", dt.datetime(2023, 11, 14, 22, 16, 40), [(1, "https://cdn/r1.mp4")]),
+            ("C1", "carousel", "", dt.datetime(2023, 11, 14, 22, 15), [(2, "https://cdn/c1b.mp4")]),
+            ("P1", "image", "صورة", dt.datetime(2023, 11, 14, 22, 13, 20), [])])
+
+    def test_max_posts_stops_paging_early(self):
+        pulled, records = self.records(2)
+        self.assertEqual(pulled, ["R1", "C1"])
+        self.assertEqual([r[0] for r in records], ["R1", "C1"])
 
 
 class GalleryDlRecordTests(unittest.TestCase):
