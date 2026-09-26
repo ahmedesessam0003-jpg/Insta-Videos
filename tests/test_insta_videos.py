@@ -46,6 +46,8 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(iv.normalize("مستشفى"), iv.normalize("مستشفي"))
         self.assertEqual(iv.normalize("الحناء"), iv.normalize("الحنا"))
         self.assertEqual(iv.normalize("ب٥"), "ب5")
+        self.assertEqual(iv.normalize("ڤيتامين الأوليڤيرا"), iv.normalize("فيتامين الأوليفيرا"))
+        self.assertEqual(iv.normalize("شامپو شعرچ"), iv.normalize("شامبو شعرج"))
 
     def test_hashtags_and_emoji_split_words(self):
         self.assertEqual(iv.tokenize("#معجون_الحنة🌿✨بودرة"), ["معجون", "الحنه", "بودره"])
@@ -75,7 +77,11 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(caption=caption):
                 self.assertEqual(first_match(caption), wasma)
         self.assertEqual(first_match("مرطب شفايفك المفضل"), product_named("مرطب"))
+        self.assertEqual(first_match("مرطب شفايفج المفضل"), product_named("مرطب"))  # Gulf "your"
         self.assertEqual(first_match("مرطب للشفايف"), product_named("مرطب"))
+        self.assertEqual(first_match("بلسم وڤيتامين B5"), product_named("بلسم"))
+        self.assertEqual(first_match("ڤيتامين B5 لشعر ناعم"), product_named("بلسم"))
+        self.assertEqual(first_match("شامپو يومي"), product_named("شامبو"))
         self.assertEqual(first_match("اللبان الحوجري"), product_named("بخور"))
 
     def test_no_false_positives(self):

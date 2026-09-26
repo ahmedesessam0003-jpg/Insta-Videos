@@ -59,6 +59,8 @@ _INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 _CHAR_MAP = str.maketrans({
     "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
     "ة": "ه", "ى": "ي", "ی": "ي", "ئ": "ي", "ؤ": "و", "ک": "ك",
+    # Letters Gulf captions borrow for foreign sounds: ڤيتامين، الأوليڤيرا، شامپو، شعرچ
+    "ڤ": "ف", "پ": "ب", "چ": "ج", "گ": "ك", "ژ": "ز", "ھ": "ه", "ہ": "ه", "ۃ": "ه",
     "ء": None,
     "_": " ",  # hashtags: #معجون_الحنة -> معجون الحنه
     **{chr(0x0660 + d): str(d) for d in range(10)},  # Arabic-Indic digits
@@ -68,8 +70,8 @@ _WORD = re.compile(r"[^\W_]+")
 
 _CONJUNCTIONS = "وف"
 _PREPOSITIONS = "بكل"
-# Attached pronouns allowed after a keyword word: شفايفك، شعري، بلسمها ...
-_SUFFIXES = ("", "ي", "ك", "كي", "كم", "كن", "ها", "هم", "هن", "نا")
+# Attached pronouns allowed after a keyword word: شفايفك، شعري، بلسمها، شفايفج (Gulf) ...
+_SUFFIXES = ("", "ي", "ك", "كي", "ج", "كم", "كن", "ها", "هم", "هن", "نا")
 
 
 def normalize(text: str) -> str:
@@ -1041,7 +1043,7 @@ def run(args: argparse.Namespace) -> int:
     for post, targets, videos, status in post_rows:
         base = {"التاريخ": f"{post.date:%Y-%m-%d %H:%M}", "رابط المنشور": post.url,
                 "النوع": KIND_NAMES.get(post.kind, post.kind),
-                "الوصف": " ".join(post.caption.split())[:500]}
+                "الوصف": " ".join(post.caption.split())}
         if not videos:
             rows.append({**base, "المنتج (المجلد)": " | ".join(folder for folder, _ in targets),
                          "الحالة": status})
