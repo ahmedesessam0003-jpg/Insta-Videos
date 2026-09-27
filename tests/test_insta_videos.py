@@ -478,9 +478,9 @@ class UnmatchedFolderTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_main(self, extra_keywords=(), unmatched="من غير وصف", dry_run=False):
+    def run_main(self, extra_keywords=(), unmatched="من غير وصف", dry_run=False, posts=()):
         config = {"profile": "x", "unmatched_folder": unmatched,
-                  "products": [{"name": "الوسمة", "keywords": ["الوسمة", *extra_keywords]}]}
+                  "products": [{"name": "الوسمة", "keywords": ["الوسمة", *extra_keywords], "posts": list(posts)}]}
         path = self.root / "products.json"
         path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
         downloader = FakeDownloader()
@@ -522,6 +522,15 @@ class UnmatchedFolderTests(unittest.TestCase):
         self.assertEqual(self.files("من غير وصف"), ["من غير وصف.mp4"])
         self.assertEqual((self.out / "من غير وصف" / "من غير وصف.mp4").read_text(), "https://cdn/B.mp4")
         self.assertEqual(report[("C", "الوسمة")]["الحالة"], "نُقل من «من غير وصف»")
+
+    def test_a_video_can_be_pinned_to_a_product_by_its_link(self):
+        self.run_main()
+        code, calls, report = self.run_main(posts=["https://www.instagram.com/p/B/?igsh=x"])
+        self.assertEqual((code, calls), (0, []))  # moved, not downloaded again
+        self.assertEqual(self.files("الوسمة"), ["الوسمة (1).mp4", "الوسمة (2).mp4"])
+        self.assertEqual((self.out / "الوسمة" / "الوسمة (2).mp4").read_text(), "https://cdn/B.mp4")
+        self.assertEqual(self.files("من غير وصف"), ["من غير وصف.mp4"])
+        self.assertEqual(report[("B", "الوسمة")]["الكلمة المطابقة"], iv.PINNED)
 
     def test_the_folder_can_be_turned_off(self):
         code, calls, report = self.run_main(unmatched="")

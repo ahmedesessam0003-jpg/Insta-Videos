@@ -146,6 +146,7 @@ class Product:
     name: str
     keywords: list[Keyword]
     folder: str = ""  # actual folder name on disk, filled by resolve_folders()
+    posts: frozenset[str] = frozenset()  # shortcodes pinned to this product whatever their caption
 
 
 @dataclass(frozen=True)
@@ -239,7 +240,8 @@ def load_config(path: Path) -> Config:
         keywords = [k for k in (compile_keyword(str(t)) for t in texts) if k]
         if not keywords:
             raise UserError(f"لا توجد كلمات بحث صالحة للمنتج: {name}")
-        products.append(Product(name, keywords))
+        posts = frozenset(to_shortcode(str(p)) for p in as_list(item.get("posts")) if str(p).strip())
+        products.append(Product(name, keywords, posts=posts))
     if not products:
         raise UserError(f"لا توجد منتجات في {path.name}")
 
@@ -894,6 +896,7 @@ def backend_order(choice: str, has_cookies: bool) -> list[str]:
 
 
 NO_MATCH = "لا يطابق أي منتج"
+PINNED = "مضاف بالرابط (posts)"  # "keyword" of a post listed under a product's "posts"
 
 
 def scan_posts(posts: Iterator[PostRecord], config: Config, mode: str,
@@ -917,7 +920,9 @@ def scan_posts(posts: Iterator[PostRecord], config: Config, mode: str,
             if post.shortcode in config.exclude_posts:
                 post_rows.append((post, [], [], "مستبعد (exclude_posts)"))
                 continue
-            matches = match_caption(post.caption, config.products, mode)
+            pinned = [p for p in config.products if post.shortcode in p.posts]
+            matches = ([Match(p, PINNED, 0) for p in pinned] if pinned
+                       else match_caption(post.caption, config.products, mode))
             if not matches and not unmatched:
                 post_rows.append((post, [], [], NO_MATCH))
                 continue
