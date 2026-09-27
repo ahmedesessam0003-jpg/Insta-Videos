@@ -84,6 +84,13 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(first_match("شامپو يومي"), product_named("شامبو"))
         self.assertEqual(first_match("اللبان الحوجري"), product_named("بخور"))
 
+    def test_wordings_seen_in_the_profile_captions(self):
+        self.assertEqual(first_match("💚 ديدورنت بالشحم البقري مناسب للنساء والرجال"), product_named("ديودرنت"))
+        self.assertEqual(first_match("نعومة الحرير بماسك الحرير 👌"), product_named("ماسك"))
+        self.assertEqual(first_match("مدعوم بمكون عالمي (خلايا التفاح السويسري Stem Cells)"), product_named("بخاخ"))
+        self.assertEqual(first_match("وش أكتر وقت تحسين فيه بجفاف الشفايف ؟ 👄"), product_named("مرطب"))
+        self.assertEqual(first_match("برنامج التحول الكامل من Natural Roots يحتوي على 6 منتجات"), None)
+
     def test_no_false_positives(self):
         for caption in ("عروض الموسم", "موسمه جديد", "بان الفرق من أول استخدام", "زيت نواة التمر",
                         "الشحم البقري", "منتجات طبيعية 100%", ""):
