@@ -259,6 +259,7 @@ class RunTests(unittest.TestCase):
         self.assertIn("HL-04: لبرنامج التحول\n", prompt)
         self.assertIn("4 فيديو جديد", prompt)
         self.assertIn("أقصى حاجة 4 فيديوهات", prompt)
+        self.assertIn("«كل الباقات» أو «الباقات كلها» يبقى الفيديو لكل الباقات والبرامج", prompt)
         self.assertNotIn("HL-03", prompt)
         self.assertNotIn("HL-05", prompt)
         self.assertIn("لم يكتمل: 1", output)
