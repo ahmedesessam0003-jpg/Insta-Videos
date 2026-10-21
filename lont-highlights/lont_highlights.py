@@ -128,11 +128,39 @@ class _HideSecrets(logging.Filter):
         return True
 
 
+class _LastAnswer(logging.Handler):
+    """Keeps what Instagram answered when gallery-dl could not understand it (a debug message)."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.text = ""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if message.startswith("Server response"):
+            self.text = message.partition("\n")[2]
+
+
+ANSWER = _LastAnswer()
+
+
 def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="  [gallery-dl] %(message)s")
     for handler in logging.getLogger().handlers:
+        if handler.level == logging.NOTSET:
+            handler.setLevel(logging.INFO)  # gallery-dl's debug messages stay out of the console
         if not any(isinstance(f, _HideSecrets) for f in handler.filters):
             handler.addFilter(_HideSecrets())
+    instagram = logging.getLogger("instagram")
+    instagram.setLevel(logging.DEBUG)  # but Instagram's answer is kept, to show it if a step fails
+    if ANSWER not in instagram.handlers:
+        instagram.addHandler(ANSWER)
+
+
+def answer_line(text: str, size: int = 300) -> str:
+    """Instagram's answer in one short English-only line, without cookie values."""
+    text = hide_secrets(" ".join(text.split())).encode("ascii", "replace").decode()
+    return text if len(text) <= size else text[:size] + " ..."
 
 
 def shown(path: Path, base: Path) -> str:
@@ -243,6 +271,7 @@ class Instagram:
         trays, raw = [], []
         self._keep(extr, "highlights_tray", trays)
         self._keep(extr, "reels_media", raw)
+        self._lenient_user_lookup(extr, profile)
         reels, error = self._collect(extr)
         tray = trays[0] if trays and isinstance(trays[0], list) else None
         return tray, reels, _flatten(raw), error
@@ -302,8 +331,36 @@ class Instagram:
 
         setattr(api, name, keep)
 
+    def _lenient_user_lookup(self, extr, profile: str) -> None:
+        """Newer gallery-dl versions look the account up twice: on its profile page, then
+        with a GraphQL query that Instagram keeps changing. The highlights need only the
+        account's number, which the profile page gives, so the second lookup may fail."""
+        api = getattr(extr, "api", None)
+        by_id, by_page = getattr(api, "user_by_id", None), getattr(api, "user_by_web", None)
+        if not (callable(by_id) and callable(by_page)):
+            return
+        control = getattr(getattr(extr, "exc", None), "ControlException", ())
+
+        def user_by_id(user_id, *args, **kwargs):
+            try:
+                return by_id(user_id, *args, **kwargs)
+            except control:  # a login page, a stop: not this lookup's problem
+                raise
+            except Exception:
+                if self.rate_limited:
+                    raise
+                user = by_page(profile)  # kept by gallery-dl from the profile page: no new request
+                if not isinstance(user, dict) or str(user.get("id")) != str(user_id):
+                    raise
+                say("  (no problem: the account number from its profile page is used instead)")
+                return {**user, "pk": str(user_id), "username": user.get("username") or profile,
+                        "is_private": False}
+
+        api.user_by_id = user_by_id
+
     def _collect(self, extr):
         """gallery-dl's DataJob: the data only, nothing is downloaded."""
+        ANSWER.text = ""
         collector = self._job.DataJob(extr, file=None)
         stopped = []
         dispatch = collector.dispatch
@@ -392,7 +449,10 @@ def check(instagram: Instagram, error: BaseException | None) -> None:
     if instagram.rate_limited:
         raise RateLimitStop()
     if error is not None:
-        raise UserError(explain(error))
+        lines = explain(error).split("\n")
+        if ANSWER.text:
+            lines.insert(1, f"  Instagram's answer: {answer_line(ANSWER.text)}")
+        raise UserError("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

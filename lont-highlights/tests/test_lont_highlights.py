@@ -28,10 +28,12 @@ try:
     import requests
     from requests.adapters import BaseAdapter
     from gallery_dl import config as gdl_config
-    from gallery_dl.extractor import common as gdl_common
+    from gallery_dl.extractor import common as gdl_common, instagram as gdl_instagram
+    GRAPHQL = hasattr(gdl_instagram, "QUERIES")  # 1.32.14 and later read highlights through GraphQL
 except ImportError:  # the tests that go through gallery-dl are skipped
     gdl_config = None
     BaseAdapter = object
+    GRAPHQL = False
 
 try:
     import pillow_heif
@@ -146,6 +148,10 @@ class FakeInstagram:
             if part in call:
                 if status in (301, 302):
                     return status, {"Location": "https://www.instagram.com/accounts/login/?next=%2F"}, b""
+                if status == 200:  # how Instagram refuses a GraphQL query it no longer accepts
+                    return self.json({"errors": [{"message": "A server error missing_required_variable_value "
+                                                             "occured. Check server logs for details.",
+                                                  "severity": "CRITICAL", "code": 1675012}]})
                 return status, {}, b"{}"
 
         if call.startswith("cdn:"):
@@ -512,6 +518,24 @@ class RunTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("lont-hl-03-001.heic", self.media())
         self.assertIn("HEIC picture kept as .heic", out)
+
+    def test_a_refused_account_lookup_still_reads_the_highlights(self):
+        self.site.fail["user"] = 200  # what stopped the first real run: the number comes from the profile page
+        code, out = self.run_main("--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.site.data_calls(), ["tray", "reels:1001,1002,1003,1004,1005", "reels:1006,1007,1008,1009"])
+        self.assertTrue(self.raw()["complete_list"])
+
+    def test_instagram_answer_is_shown_when_it_refuses_a_step(self):
+        self.site.fail["tray"] = 200
+        code, out = self.run_main("--dry-run")
+        self.assertEqual(code, 2, out)
+        self.assertIn("STOPPED: gallery-dl stopped: KeyError:", out)
+        if GRAPHQL:  # newer gallery-dl versions log Instagram's answer, which is shown in one line
+            self.assertIn("  Instagram's answer: {\"errors\": [{\"message\": \"A server error "
+                          "missing_required_variable_value", out)
+        self.assertNotIn("Server response", out)  # gallery-dl's other debug messages stay hidden
+        self.assertTrue(out.isascii())
 
     def test_cookies_rejected_by_instagram(self):
         self.site.fail["tray"] = 302  # Instagram sends the browser to its login page
