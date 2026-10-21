@@ -705,7 +705,15 @@ def link_expired(url: str, margin: float = 600) -> bool:
 CONTENT_TYPES = {"video/mp4": ".mp4", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/pjpeg": ".jpg",
                  "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic",
                  "image/heif": ".heic", "image/avif": ".avif", "video/quicktime": ".mov", "video/webm": ".webm"}
+VIDEO_SUFFIXES = (".mp4", ".mov", ".webm")
 _HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
+
+
+def file_kind(path: Path | None, kind: str) -> str:
+    """A story's type as it is in output/: a video turned into a picture (videos_to_photos.py) is a picture."""
+    if path is None or kind == "cover":
+        return kind
+    return "video" if path.suffix.lower() in VIDEO_SUFFIXES else "image"
 
 
 def sniff(head: bytes) -> str | None:
@@ -923,9 +931,11 @@ def report_rows(raw: dict, arrangement: Arrangement, out_dir: Path, results: dic
     rows = []
     for position, circle_id in enumerate(arrangement.order, 1):
         circle = raw["circles"][circle_id]
-        photos, videos = counts(circle)
         plans = planned_files(circle, position)
-        saved = sum(1 for plan in plans if saved_file(out_dir, raw["files"], plan))
+        found = {plan.stem: saved_file(out_dir, raw["files"], plan) for plan in plans}
+        kinds = [file_kind(found[plan.stem], plan.kind) for plan in plans if plan.kind != "cover"]
+        photos, videos = kinds.count("image"), kinds.count("video")
+        saved = sum(1 for path in found.values() if path)
         result = (results or {}).get(circle_id)
         if plans and saved == len(plans):
             status = "اتحمّلت كاملة"
@@ -968,7 +978,8 @@ def write_report(path: Path, rows: list[list], base: Path) -> bool:
         return False
 
 
-def write_manifest(path: Path, raw: dict, arrangement: Arrangement, out_dir: Path) -> None:
+def write_manifest(path: Path, raw: dict, arrangement: Arrangement, out_dir: Path,
+                   downloaded_at: str | None = None) -> None:
     highlights = []
     for position, circle_id in enumerate(arrangement.order, 1):
         circle = raw["circles"][circle_id]
@@ -979,12 +990,13 @@ def write_manifest(path: Path, raw: dict, arrangement: Arrangement, out_dir: Pat
             return found.name if found else None
 
         prefix = f"{PREFIX}-{position:02d}"
-        items = [{"position": number, "file": name(f"{prefix}-{number:03d}"), "type": item["type"],
+        items = [{"position": number, "file": name(f"{prefix}-{number:03d}"),
+                  "type": file_kind(files.get(f"{prefix}-{number:03d}"), item["type"]),
                   "width": item["width"], "height": item["height"]}
                  for number, item in enumerate(circle.get("items") or [], 1)]
         highlights.append({"position": position, "title": circle["title"], "cover_file": name(f"{prefix}-cover"),
                            "items": items})
-    manifest = {"profile": PROFILE, "downloaded_at_utc": utc_now(), "highlights": highlights}
+    manifest = {"profile": PROFILE, "downloaded_at_utc": downloaded_at or utc_now(), "highlights": highlights}
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
