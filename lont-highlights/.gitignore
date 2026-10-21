@@ -1,0 +1,9 @@
+# Your Instagram login: never commit or share it
+cookies.txt
+cookies.json
+
+# Made by lont_highlights.py
+raw_list.json
+output/
+*.part
+*.tmp
